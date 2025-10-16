@@ -1,241 +1,175 @@
-import argparse
-import os
-
-import torch
-from torch import nn
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+import math
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import utils
 
-import datasets
-from positional_embeddings import PositionalEmbedding
+import io
+import wandb
+from PIL import Image
+import geometry
 
+class DDPM:
 
-class Block(nn.Module):
-    def __init__(self, size: int):
-        super().__init__()
+    def __init__(self, betas):
+        self.betas = betas
+        self.a, self.abar = alpha_bar(betas)  # \bar{α}_t for t=1..T
+        self.sqrt_a = torch.sqrt(self.a)
+        self.sqrt_one_minus_alpha_bars = torch.sqrt(1 - self.abar)
+        self.sqrt_abar = torch.sqrt(self.abar)
 
-        self.ff = nn.Linear(size, size)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor):
-        return x + self.act(self.ff(x))
-
-
-class MLP(nn.Module):
-    def __init__(self, hidden_size: int = 128, hidden_layers: int = 3, emb_size: int = 128,
-                 time_emb: str = "sinusoidal", input_emb: str = "sinusoidal"):
-        super().__init__()
-
-        self.time_mlp = PositionalEmbedding(emb_size, time_emb)
-        self.input_mlp1 = PositionalEmbedding(emb_size, input_emb, scale=25.0)
-        self.input_mlp2 = PositionalEmbedding(emb_size, input_emb, scale=25.0)
-
-        concat_size = len(self.time_mlp.layer) + \
-            len(self.input_mlp1.layer) + len(self.input_mlp2.layer)
-        layers = [nn.Linear(concat_size, hidden_size), nn.GELU()]
-        for _ in range(hidden_layers):
-            layers.append(Block(hidden_size))
-        layers.append(nn.Linear(hidden_size, 2))
-        self.joint_mlp = nn.Sequential(*layers)
-
-    def forward(self, x, t):
-        x1_emb = self.input_mlp1(x[:, 0])
-        x2_emb = self.input_mlp2(x[:, 1])
-        t_emb = self.time_mlp(t)
-        x = torch.cat((x1_emb, x2_emb, t_emb), dim=-1)
-        x = self.joint_mlp(x)
-        return x
+    def plot_alpha_beta(self):
+        T = len(self.betas)
+        plt.plot(range(1, T + 1), self.a, label=r"$'\alpha'_t$ (Linear Beta)")
+        plt.plot(range(1, T + 1), self.betas, label=r"$'\beta'_t$ (Linear Beta)")
+        plt.plot(range(1, T + 1), self.abar, label=r"$\bar{\alpha}_t$ (Linear Beta)")
+        plt.xlabel("Timestep")
+        plt.ylabel(r"$\bar{\alpha}_t$")
+        plt.title("Alpha Bar vs Timestep (Linear Beta Schedule)")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
 
 
-class NoiseScheduler():
-    def __init__(self,
-                 num_timesteps=1000,
-                 beta_start=0.0001,
-                 beta_end=0.02,
-                 beta_schedule="linear"):
 
-        self.num_timesteps = num_timesteps
-        if beta_schedule == "linear":
-            self.betas = torch.linspace(
-                beta_start, beta_end, num_timesteps, dtype=torch.float32)
-        elif beta_schedule == "quadratic":
-            self.betas = torch.linspace(
-                beta_start ** 0.5, beta_end ** 0.5, num_timesteps, dtype=torch.float32) ** 2
+    def denoising_step(self, t, z_t, z_eps):
+        alpha_t = self.a[t].unsqueeze(-1)
+        beta_t = self.betas[t].unsqueeze(-1)
+        abar_t = self.abar[t].unsqueeze(-1)
+        abar_tm1 = self.abar[t - 1].unsqueeze(-1)
+        abar_tm1[t==0] = abar_t[t==0]
+        # print("A", z_t.shape, beta_t.shape, abar_t.shape, z_eps.shape)
 
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
-        self.alphas_cumprod_prev = F.pad(
-            self.alphas_cumprod[:-1], (1, 0), value=1.)
+        z_mean_tm1 = 1 / alpha_t.sqrt() * (z_t - (1 - alpha_t) / torch.clamp(1-abar_t, min=1e-20).sqrt() * z_eps)
 
-        # required for self.add_noise
-        self.sqrt_alphas_cumprod = self.alphas_cumprod ** 0.5
-        self.sqrt_one_minus_alphas_cumprod = (1 - self.alphas_cumprod) ** 0.5
+        noise = torch.randn_like(z_t)
+        noise[t == 0] = 0
 
-        # required for reconstruct_x0
-        self.sqrt_inv_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod)
-        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(
-            1 / self.alphas_cumprod - 1)
+        # Fixed variance choice
+        z_var_tm1 = beta_t * (1 - abar_tm1) / torch.clamp(1.0 - abar_t, min=1e-20) # posterior variance (small)
+        if False:  # high variance alternative (may lead to more diversity but lower quality)
+            z_var_tm1 = beta_t.clamp(min=1e-20)
 
-        # required for q_posterior
-        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
+        z_tm1 = z_mean_tm1 + z_var_tm1.sqrt()*noise
 
-    def reconstruct_x0(self, x_t, t, noise):
-        s1 = self.sqrt_inv_alphas_cumprod[t]
-        s2 = self.sqrt_inv_alphas_cumprod_minus_one[t]
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-        return s1 * x_t - s2 * noise
+        z_0_hat = (z_t - torch.sqrt(torch.clamp(1.0 - abar_t, min=1e-20)) * z_eps) / torch.sqrt(abar_t)
 
-    def q_posterior(self, x_0, x_t, t):
-        s1 = self.posterior_mean_coef1[t]
-        s2 = self.posterior_mean_coef2[t]
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-        mu = s1 * x_0 + s2 * x_t
-        return mu
+        # if False: # rescale if norm>1 instead of clamp h_0
+        #     norm = z_0_hat.norm(dim=-1, keepdim=True).clamp(min=1)
+        #     z_0_hat = z_0_hat/norm
+        #
+        #     norm = z_tm1.norm(dim=-1, keepdim=True).clamp(min=1)
+        #     z_tm1 = z_tm1/norm
 
-    def get_variance(self, t):
-        if t == 0:
-            return 0
+        boundfn = lambda x : torch.clamp(x, -1, 1)
 
-        variance = self.betas[t] * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t])
-        variance = variance.clip(1e-20)
-        return variance
+        if True:
+            boundfn = lambda x : geometry.project_from_inside_cube(z_t, x)
+            #boundfn = lambda x : geometry.project_from_inside_sphere(z_t, x)
 
-    def step(self, model_output, timestep, sample):
-        t = timestep
-        pred_original_sample = self.reconstruct_x0(sample, t, model_output)
-        pred_prev_sample = self.q_posterior(pred_original_sample, sample, t)
+        if True: # clamp
+            return boundfn(z_tm1), z_mean_tm1, z_var_tm1, boundfn(z_0_hat),
+        else: # does not train at all
+            return z_tm1, z_mean_tm1, z_var_tm1, z_0_hat,
 
-        variance = 0
-        if t > 0:
-            noise = torch.randn_like(model_output)
-            variance = (self.get_variance(t) ** 0.5) * noise
-
-        pred_prev_sample = pred_prev_sample + variance
-
-        return pred_prev_sample
-
-    def add_noise(self, x_start, x_noise, timesteps):
-        s1 = self.sqrt_alphas_cumprod[timesteps]
-        s2 = self.sqrt_one_minus_alphas_cumprod[timesteps]
-
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-
-        return s1 * x_start + s2 * x_noise
-
-    def __len__(self):
-        return self.num_timesteps
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor):
+        # forward diffusion process
+        """
+        x_t = sqrt(ā_t) x0 + sqrt(1 - ā_t) ε,  ε ~ N(0, I)
+        x0: (B, C, H, W) or (B, D, ...)
+        t : (B, 1) ints in [0, T]
+        """
+        B = x0.shape[0]
+        eps = torch.randn_like(x0)
+        abar_t = self.abar[t]
+        x_t = abar_t.sqrt().unsqueeze(-1) * x0 + (1.0 - abar_t).sqrt().unsqueeze(-1) * eps # checked
+        return x_t, eps
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--experiment_name", type=str, default="base")
-    parser.add_argument("--dataset", type=str, default="dino", choices=["circle", "dino", "line", "moons"])
-    parser.add_argument("--train_batch_size", type=int, default=32)
-    parser.add_argument("--eval_batch_size", type=int, default=1000)
-    parser.add_argument("--num_epochs", type=int, default=200)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--num_timesteps", type=int, default=50)
-    parser.add_argument("--beta_schedule", type=str, default="linear", choices=["linear", "quadratic"])
-    parser.add_argument("--embedding_size", type=int, default=128)
-    parser.add_argument("--hidden_size", type=int, default=128)
-    parser.add_argument("--hidden_layers", type=int, default=3)
-    parser.add_argument("--time_embedding", type=str, default="sinusoidal", choices=["sinusoidal", "learnable", "linear", "zero"])
-    parser.add_argument("--input_embedding", type=str, default="sinusoidal", choices=["sinusoidal", "learnable", "linear", "identity"])
-    parser.add_argument("--save_images_step", type=int, default=1)
-    config = parser.parse_args()
+    # ---- Apply the trained model: full reverse sampling loop ----
+    @torch.no_grad()
+    def ddpm_sample(self, eps_model, z_1, conditions, noT=False):
+        """
+        Generate x0 samples with a fixed-variance DDPM.
+        - eps_model: trained network, takes (x_t, t) and predicts ε
+        - shape: (B,C,H,W) or (B,D,...) of desired samples
+        - betas: (T,) schedule used at training
+        - var_type: 'fixed_small' (posterior variance) or 'fixed_large' (β_t)
+        - x_T: optional starting noise; if None, standard normal is used
+        """
+        eps_model.eval()
 
-    dataset = datasets.get_dataset(config.dataset)
-    dataloader = DataLoader(
-        dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
+        T = self.betas.numel() - 1
 
-    model = MLP(
-        hidden_size=config.hidden_size,
-        hidden_layers=config.hidden_layers,
-        emb_size=config.embedding_size,
-        time_emb=config.time_embedding,
-        input_emb=config.input_embedding)
+        B = z_1.shape[0]
+        z_t = z_1 # init
+        intermediate_start = []
+        intermediate_mean = []
+        intermediate_end = []
+        intermediate_x0 = []
+        for t_int in range(T, 0, -1):  # T, T-1, ..., 1
+            intermediate_start.append(z_t)
+            # Scalars for this step (broadcasted automatically)
+            beta_t = self.betas[t_int - 1]
+            alpha = 1.0 - beta_t
+            abar_t = self.abar[t_int]
+            abar_tm1 = self.abar[t_int - 1]
 
-    noise_scheduler = NoiseScheduler(
-        num_timesteps=config.num_timesteps,
-        beta_schedule=config.beta_schedule)
+            # Model prediction εθ(x_t, t)
+            t_batch = torch.full((B,), t_int, dtype=torch.long)
+            cond_list = conditions + [t_batch]
+            if noT:
+                cond_list = conditions
+            eps_pred = eps_model(z_t, cond_list)["y"]
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-    )
+            # note, z_t updated/replaced, moving on to the next time step
+            z_t, z_mean, z_var, z_0  = self.denoising_step(t_batch, z_t, eps_pred)
 
-    global_step = 0
-    frames = []
-    losses = []
-    print("Training model...")
-    for epoch in range(config.num_epochs):
-        model.train()
-        progress_bar = tqdm(total=len(dataloader))
-        progress_bar.set_description(f"Epoch {epoch}")
-        for step, batch in enumerate(dataloader):
-            batch = batch[0]
-            noise = torch.randn(batch.shape)
-            timesteps = torch.randint(
-                0, noise_scheduler.num_timesteps, (batch.shape[0],)
-            ).long()
+            if not utils.is_valid(eps_pred):
+                print("Warning, encountered issue", eps_pred)
 
-            noisy = noise_scheduler.add_noise(batch, noise, timesteps)
-            noise_pred = model(noisy, timesteps)
-            loss = F.mse_loss(noise_pred, noise)
-            loss.backward()
 
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+            if not utils.is_valid(z_mean):
+                print("Warning, encountered issue", z_mean)
 
-            progress_bar.update(1)
-            logs = {"loss": loss.detach().item(), "step": global_step}
-            losses.append(loss.detach().item())
-            progress_bar.set_postfix(**logs)
-            global_step += 1
-        progress_bar.close()
+            intermediate_mean.append(z_mean)
+            intermediate_end.append(z_t)
+            intermediate_x0.append(z_0)
 
-        if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
-            # generate data with the model to later visualize the learning process
-            model.eval()
-            sample = torch.randn(config.eval_batch_size, 2)
-            timesteps = list(range(len(noise_scheduler)))[::-1]
-            for i, t in enumerate(tqdm(timesteps)):
-                t = torch.from_numpy(np.repeat(t, config.eval_batch_size)).long()
-                with torch.no_grad():
-                    residual = model(sample, t)
-                sample = noise_scheduler.step(residual, t[0], sample)
-            frames.append(sample.numpy())
+            if not utils.is_valid(z_t) or not utils.is_valid(z_0):
+                print("NaN", t_int, beta_t, alpha, abar_t, abar_tm1, eps_pred, z_mean, z_t, z_0)
+                return z_t
 
-    print("Saving model...")
-    outdir = f"exps/{config.experiment_name}"
-    os.makedirs(outdir, exist_ok=True)
-    torch.save(model.state_dict(), f"{outdir}/model.pth")
+        return z_0, [intermediate_start, intermediate_mean, intermediate_end, intermediate_x0]  # this is x_0 (same scaling as your training data)
 
-    print("Saving images...")
-    imgdir = f"{outdir}/images"
-    os.makedirs(imgdir, exist_ok=True)
-    frames = np.stack(frames)
-    xmin, xmax = -6, 6
-    ymin, ymax = -6, 6
-    for i, frame in enumerate(frames):
-        plt.figure(figsize=(10, 10))
-        plt.scatter(frame[:, 0], frame[:, 1])
-        plt.xlim(xmin, xmax)
-        plt.ylim(ymin, ymax)
-        plt.savefig(f"{imgdir}/{i:04}.png")
-        plt.close()
 
-    print("Saving loss as numpy array...")
-    np.save(f"{outdir}/loss.npy", np.array(losses))
+    def ddim_step(self, x_t, t, tau, eps_pred):
+        """
+        x_t: current sample at step t
+        t: current index
+        tau: target index (< t)
+        eps_pred: model prediction eps_theta(x_t, t)
+        abar: precomputed cumulative alphas (len T+1, abar[0]=1)
+        """
+        abar_t = self.abar[t]
+        abar_tau = self.abar[tau]
 
-    print("Saving frames...")
-    np.save(f"{outdir}/frames.npy", frames)
+        # Predict x0
+        x0_pred = (x_t - torch.sqrt(1 - abar_t) * eps_pred) / torch.sqrt(abar_t)
+
+        # Deterministic update
+        x_tau = torch.sqrt(abar_tau) * x0_pred + torch.sqrt(1 - abar_tau) * eps_pred
+        return x_tau
+
+def alpha_bar(betas: torch.Tensor) -> torch.Tensor:
+    """Compute \bar{α}_t = ∏_{i=1}^t (1 - β_i)."""
+    alphas = 1.0 - betas
+    alphasbar = torch.cumprod(alphas, dim=0)
+    return alphas, alphasbar
+
+# ---- Linear schedule (Ho et al. 2020) ----
+def linear_beta_schedule(T: int, beta_start=1e-4, beta_end=2e-2,
+                         device=None, dtype=torch.float32) -> torch.Tensor:
+    """β_t linearly spaced in [beta_start, beta_end]."""
+    return torch.linspace(beta_start, beta_end, T, device=device, dtype=dtype)
